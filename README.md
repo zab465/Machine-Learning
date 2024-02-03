@@ -8,4 +8,4 @@ In this repository, you will find some basic machine learning algorithms and how
 Some of the ones covered in here include: 
 
 * K-means clustering
-* K-Nearest Neighbors
+* K-Nearest Neighbors (binary classifier)
