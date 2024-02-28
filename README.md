@@ -9,3 +9,6 @@ So far, the ones covered in here include:
 
 * K-means clustering
 * K-Nearest Neighbors (binary classifier)
+* A network of Wikipedia reverts (in Romania)
+
+_Note_: we here construct the network of reverts between authors on Wikipedia and explore a social theory of competition between most similar individuals. 
