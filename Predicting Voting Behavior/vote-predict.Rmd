@@ -1,0 +1,267 @@
+---
+title: "Predicting Voting Intentions in the US 2024 Presidential Elections"
+output: html_document
+date: "2024-04-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+Data available for download here: https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi%3A10.7910/DVN/PR4L8P 
+
+#### Introduction 
+
+A multitude of factors may prompt an individual to vote, but which of these are generalizable to the wider population? This report aims to predict voter turnout in the 2024 US presidential elections. It will discuss the selection of data, variables, and the chosen model, considering budget constraints.
+
+#### Choice of Data
+
+I opt to use the 2022 Cooperative Election Study dataset, which includes 60,000 pre and post-midterm election samples across the US. Although the model aims to predict presidential election turnout, I argue that the 2022 midterm election data is more suitable here; post-Covid-19 elections marking a new political era (Lemke et al., 2022), rendering predictions based on 2020 or 2016 data less relevant to current behaviors and circumstances.
+
+
+#### Preliminary Cleaning 
+
+Firstly, I exclude variables related to post-study observations as this data is unavailable for the 2024 elections, and would potentially compromise the model's adaptability. Similarly, I omit variables concerning response timings, as they do not align conceptually with our objectives and only add to data dimensionality.
+
+Second, I exclude non-US citizen observations to ensure the model predicts voter turnout accurately. This prevents organizational efforts from being misdirected towards ineligible individuals. This will affect the weights in the data designed to balance demographic representation. However, non-US citizens make up less than 2% of the data, and including them is a greater risk to model performance than the weight-shift incurred from their removal.
+
+
+I exclude variables with over 10% missingness, opting to simply attribute missing values to their own categories for factor variables; we cannot assume missingness at random, particularly for sensitive political opinions or protected characteristics, but this way we retain information about missingness. For continuous variables, howeevr, I impute the mean. Owing to high data dimensionality, I refrain from including a missing value indicator or one-hot encoding variables, addressing this concern in the feature selection stage. 
+
+Finally, I simplify the response variable for voting intention (assumed to be truthful), categorizing definite and probable voters, as well as early and absentee voters, as 'intend to vote'; non-respondents, the undecided, and negatives as 'do not intend to vote'. This approach, while reducing detail, efficiently aligns the model's focus with the organization's outreach efforts.
+
+
+```{r eval=TRUE}
+vote_data <- read.csv("data/CCES22_Common_OUTPUT_vv_topost.csv")
+# CC22_363 = outcome 
+```
+
+```{r eval=TRUE}
+selected_variables <- vote_data %>%
+	filter(cit1 != 2) %>%  # remove non-US citizens 
+  select(-(contains("_t"))) %>% 
+	select(-contains("religpew_")) %>% 
+	select(-c(caseid, X, add_confirm, CCEStake, CC22_430c, vvweight, vvweight_post, dualctry, ccesmodule, regzip, inputzip, CC22_421r, CC22_422r, lookupzip, countyfips, cit1, votereg_f, comptype, internethome, internetwork, phone)) %>% 
+	select(-contains("post")) %>% 
+	select(where(~!is.character(.)))
+```
+```{r, creating factor levels for the remaining variables, eval = TRUE}
+identify_and_replace_factor_vars <- function(df, threshold = 13, always_factors = NULL) {
+  for (col in names(df)) {
+    if (is.numeric(df[[col]]) || (col %in% always_factors)) {  
+      unique_values <- length(unique(df[[col]]))
+      if (unique_values <= threshold) {
+        df[[col]] <- as.factor(df[[col]])  # Convert numeric variable to factor
+      }
+    }
+  }
+  return(df)
+}
+
+# List of variables that should always be treated as factors
+always_factors_list <- c("CC22_367", "CC22_367a", "CC22_402a", "CC22_402b", "industry", "inputstate", "cdid117", "cdid118")
+
+# Replace potential factor variables with a unique value threshold of 18 
+# (some variables have up to 18 different levels)
+selected_variables <- identify_and_replace_factor_vars(selected_variables, threshold = 13, always_factors = always_factors_list)
+
+# manually deal with differently formatted columns: # Replace 97 with NA and NA with 99
+selected_variables$faminc_new[selected_variables$faminc_new == 97] <- NA
+selected_variables$faminc_new[is.na(selected_variables$faminc_new)] <- 99
+
+# Convert variable to factor
+selected_variables$faminc_new <- as.factor(selected_variables$faminc_new)
+```
+```{r deal with missing values, eval = TRUE}
+# to deal with missingness here we can impute the mean for continuous variables
+# for multiple response variables we cannot assume missignness at random so we create a missing value category
+# Identify factor variables
+factor_vars <- sapply(selected_variables, is.factor)
+
+# Add a new level for missing values in factor variables
+for (col in names(selected_variables)[factor_vars]) {
+  selected_variables[[col]] <- addNA(selected_variables[[col]])  # Add NA as a level
+  selected_variables[[col]] <- as.character(selected_variables[[col]])  # Convert factor to character
+  selected_variables[[col]][is.na(selected_variables[[col]])] <- "99"  # Assign "99" label to missing values
+  selected_variables[[col]] <- as.factor(selected_variables[[col]])  # Convert back to factor
+}
+
+# Impute missing values with the mean for numeric variables
+numeric_vars <- sapply(selected_variables, is.numeric)
+for (col in names(selected_variables)[numeric_vars]) {
+  selected_variables[[col]][is.na(selected_variables[[col]])] <- mean(selected_variables[[col]], na.rm = TRUE)
+}
+```
+
+```{r, removing predictors in the model which have too many missing variables, eval=TRUE, warning=FALSE}
+# this reduces noise and bias? 
+# Calculate the percentage of "99" level factors for each factor variable
+percent_99 <- sapply(selected_variables[factor_vars], function(x) {
+  sum(x == "99", na.rm = TRUE) / length(x) * 100
+})
+
+# Find factor variables where the percentage of "99" level factors is greater than 10%
+remove_factors <- names(percent_99[percent_99 > 10])
+# Remove factor variables where the percentage of "99" level factors is greater than 10%
+selected_variables <- selected_variables[, !(names(selected_variables) %in% remove_factors)]
+```
+```{r combine levels of outcome, eval=TRUE}
+# Combine levels 1, 2, 3, and 4 into one level
+selected_variables$CC22_363 <- fct_collapse(selected_variables$CC22_363, "Levels_1_to_4" = c(1, 2, 3, 4))
+
+# Combine levels 5, 6, and 99 into another level
+selected_variables$CC22_363 <- fct_collapse(selected_variables$CC22_363, "Levels_5_to_99" = c(5, 6, 99))
+
+# Create a binary (0-1) dummy variable
+selected_variables$CC22_363 <- as.factor(as.numeric(selected_variables$CC22_363 == "Levels_1_to_4"))
+```
+```{r construct training and testing set, eval=TRUE}
+# split into training and testing
+train_index2 <- createDataPartition(selected_variables$CC22_363, p = 0.8, list = FALSE)
+X_train2 <- selected_variables[train_index2, -which(names(selected_variables) == "CC22_363")]
+y_train2 <- selected_variables[train_index2, "CC22_363"]
+X_test2 <- selected_variables[-train_index2, -which(names(selected_variables) == "CC22_363")]
+y_test2 <- selected_variables[-train_index2, "CC22_363"]
+```
+
+#### Feature selection 
+
+After preliminary data cleaning, conceptually irrelevant features are removed, but that does not complete feature selection; the dimensionality of the data is still high, and the features included thus far are not necessarily beneficial to the model. For this reason, I perform a random forest for feature selection. Figure 1 below illustrates the distribution of importance in terms of mean decrease in accuracy. 
+
+
+```{r feature importance tree, eval=TRUE}
+X_train_feat_select <- X_train2 %>% 
+	select(-c(commonweight))
+# Assuming X_train is your predictor matrix and y_train is your response vector
+# Train a Random Forest model
+rf_model <- randomForest(
+  formula = y_train2 ~ .,  
+  data = X_train2,         
+  ntree = 10,            
+  importance = TRUE     
+)
+
+# Extract variable importance scores
+importance_scores <- importance(rf_model)
+
+# Order the scores in decreasing order
+ordered_importance <- importance_scores[order(importance_scores[, 3], decreasing = TRUE), ]
+```
+
+```{r feature importance plot, eval = TRUE}
+# Plot variable importance scores
+plot1 <- ggplot(data = ordered_importance, aes(x = reorder(rownames(ordered_importance), MeanDecreaseAccuracy), y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(x = "Feature", y = "Mean Decrease in Accuracy") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  ggtitle("Figure 1: Variable Importance Scores")
+plot1
+```
+
+The figure above guides the exclusion of variables with less than a 1-point impact on mean accuracy. Some variables in this group are specific levels of categorical variables, and removing them is counter-productive for future data collection strategies; I thus preserve these levels (one-hot encoded by authors) in the in the final model, even if their effect on accuracy is low. This helps preserve the integrity of the features which will serve the model. This results in a feature selection of 73 variables (excluding the weights), which I use to train my model. 
+
+
+#### Model and Model Performance
+
+To predict turnout, I employ a random forest model. Trees help capture non-linear relationships between features, and their aggregation helps reduce variance. This approach accommodates the variability inherent in modeling human behavior and mitigates the impact of missing data and the noise introduced by my choice not to impute (due to presumed non-randomness). The model enables the inclusion weights ("commonweight"), which helps address population disparities when post-survey variables are excluded. I evaluate performance based on recall and precision, with recall in the negative class and precision in the positive class being crucial measures here. Table 1 summarizes the expected precision and recall of the model.
+
+
+```{r feature importance DF, eval=TRUE}
+# select the variables with mean decrease in accuracy effect of more than 1 
+# preserve the individual levels of variables by keeping _"a number"
+selected_variables_imp <- ordered_importance[
+ ordered_importance[, "MeanDecreaseAccuracy"] > 1 & 
+ 	!grepl("_[0-9]+$", rownames(ordered_importance)), ]
+
+# Extract the selected feature names
+selected_feature_names <- rownames(selected_variables_imp)
+```
+
+```{r re-set a training and validation set, eval=TRUE}
+# Filter the original training and testing data based on the selected features
+X_train_future <- X_train2[, selected_feature_names, drop = FALSE]
+X_test_future <- X_test2[, selected_feature_names, drop = FALSE]
+```
+
+```{r tree with the weights as an argument, eval=TRUE}
+# factor for the outcome variables 
+y_train2 <- as.factor(y_train2)
+y_test2 <- as.factor(y_test2)
+
+# create a weight vector to include in model 
+train_weight <- X_train_future %>% 
+	select(commonweight)
+train_weight <- train_weight$commonweight
+
+# remove the weight from the data 
+X_train_future <- X_train_future %>% 
+	select(-commonweight)
+X_test_future <- X_test_future %>% 
+	select(-c(commonweight))
+
+# Train a Random Forest model
+rf_model1 <- randomForest(
+  formula = y_train2 ~ ., 
+  data = X_train_future, 
+  ntree = 300,  # Number of trees in the forest
+  mtry = 12,  # Number of variables randomly sampled as candidates at each split
+  importance = TRUE, 
+  weights = train_weight
+)
+
+
+# Make predictions on the test set
+# predictions <- predict(rf_model1, newdata = X_test_future)
+# Make predictions on the test set
+predictions_prob <- predict(rf_model1, newdata = X_test_future, type = "prob")  # Predict probabilities
+predictions <- ifelse(predictions_prob[, "1"] > 0.9, 1, 0)  
+conf_mat <- table(Actual = y_test2, Predicted = predictions)
+# Calculate precision for positive and negative classes
+# Precision for positive class
+precision_pos <- conf_mat[2, 2] / sum(conf_mat[, 2])
+
+# Precision for negative class
+precision_neg <- conf_mat[1, 1] / sum(conf_mat[, 1]) 
+
+# Calculate recall for positive and negative classes
+# Recall for positive class
+recall_pos <- conf_mat[2, 2] / sum(conf_mat[2, ])
+
+# Recall for negative class
+recall_neg <- conf_mat[1, 1] / sum(conf_mat[1, ])  
+
+# Combine precision and recall values into a data frame
+metrics_table <- data.frame(
+  Class = c("Positive", "Negative"),
+  Precision = c(precision_pos, precision_neg),
+  Recall = c(recall_pos, recall_neg)
+)
+
+```
+```{r table for the results, eval = TRUE}
+# Display the data frame as a table
+knitr::kable(metrics_table, caption = "Table 1: Performance Metrics of Model") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T, position = "center")
+```
+
+
+Table 1 presents the model's expected recall and precision for both positive (voter) and negative (non-voter) outcomes. Positive class recall, indicating the proportion of actual voters correctly identified by the model, is approximately 81%, while positive class precision, representing the accuracy of predicting voters, is nearly 99%. These metrics suggest that the model effectively identifies potential voters without misclassifying many non-voters. The high precision in the positive class helps limit false positives (predict non-voters as voters), which is crucial for increasing turnout. Although the lower recall in the positive class may seem concerning, the organization's risk of misclassifying voters as non-voters (false negatives) is relatively low, at about 18%. Therefore, the model's performance balances between accurately targeting potential voters and minimizing misclassification costs.
+
+For the negative class, precision stands at around 44%, while recall is high at approximately 94%. This high recall indicates effective minimization of false negatives (predicting non-voters as voters), which is crucial for the organization's goals. Although precision in the negative class is lower (chance of predicting voters as non-voters), the model ensures minimal misclassification of actual non-voters as voters, capturing the target population for intervention. While higher precision for the negative class would be ideal, prioritizing intervention for non-voters remains the primary focus.
+
+These results are based on a stringent threshold of 0.9 for predicting the positive class, ensuring high confidence in voter prediction to avoid misclassifying non-voters. This focus increases negative class recall but may lead to lower precision in the negative class. Despite class imbalance challenges, the model demonstrates high recall for the negative class, suggesting effective characterization of non-voters, likely facilitated by the high positive class threshold. This favors the integrity of the non-voter classification for the purposes of the organization, with the inclusion of some mis-classified voters. Overall, the model exhibits satisfactory performance for the organization's intervention in targeting non-voters. While there may be some overlap in targeting voters, interventions are unlikely to alter the voting intention of those already planning to vote.
+
+
+
+## References
+
+Lemke, C. and Wiedekind, J. (2022) ‘Voting in the Shadow of the Pandemic’, in C. Lemke and J. Wiedekind (eds) The Battle for the White House: The US Presidential Election 2020 under the impression of Polarization, Coronavirus Pandemic and Social Tensions. Wiesbaden: Springer Fachmedien, pp. 27–48. Available at: https://doi.org/10.1007/978-3-658-38934-5_3.
+
+
+
+## Appendix Code
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE} 
+# this chunk generates the complete code appendix. 
+# eval=FALSE tells R not to run (``evaluate'') the code here (it was already run before).
+```
