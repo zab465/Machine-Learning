@@ -1,0 +1,343 @@
+## Defining a data and prediction function
+
+## 1. Building a classification tree estimator
+
+A CART model is very algorithmically complex. At each possible split we a) consider whether splitting is possible, and if so b) consider every variable and splitting point to find the optimal split.
+
+For ease of building, I assume here that the data-generating process is entirely known and visualize the production of data for the binary task below: 
+
+```{r}
+# still a binary classification task so we're calculating probabilities
+# with categories you have to consider every single split of data so we're doing 
+library(tidyverse)
+set.seed(89) 
+
+genX <- function(n) {
+  return(
+    data.frame(X1 = runif(n,0,1),
+               X2 = runif(n,0,1),
+               X3 = runif(n,0,1),
+               X4 = runif(n,0,1),
+               X5 = runif(n,0,1))
+  )
+}
+# 1 if true and 0 if false 
+genY <- function(X) {
+  Ylin <- 10*I(X$X1>0.7)-20*I(X$X2 < 0.35)
+  # convert to probabilities
+  Yp <- 1/(1+exp(-Ylin))
+  # convert to 1's and 0's
+  Y <- rbinom(nrow(X),1,Yp)
+  return(Y)
+}
+
+# Generate 1000 observations and corresponding labels
+train_X <- genX(1000)
+train_y <- genY(train_X)
+```
+```{r}
+ggplot(data = cbind(train_X, y = train_y), 
+       aes(x = X1, y = X2, color = as.factor(y))) +
+  geom_point(size = 2) +
+  theme_bw() +
+  labs(color = "Class") +
+  theme(legend.position = "bottom")
+```
+
+We can see 3 distinct regions in the plot: where $X2 < 0.35$, all the points are red; where $X2 > 0.35$ and $X1 > 0.7$, all the points are blue; and at all other points there is an even mix of the two classes (this already means that the possible accuracy of the model is inherently limited to an extent).
+
+For the model we'll need to measure the node impurity and then characterize the decrease in node impurity. 
+
+```{r}
+# criterion: gini to decide what the split of the data is 
+# what's the inequality of the input vector
+
+# look at every class of our outcome and then aggregate
+# calculate the node purity using the gini index
+gini_index <- function(y) {
+  
+  # calculate each class component of the sum
+  # unique(y) is more extensible to other classification problems
+  # for every unique (value a) (for every class) --> we want the proportion of elements in that class 
+  # by the proportion of what isn't in that class
+  gini_c <- sapply(unique(y), function (a) mean(y == a)*(1-mean(y == a)))
+  
+  # we have to return a whole single number 
+  return(sum(gini_c))
+}
+
+# now we have a way for scoring every node in the tree based on purity
+# we want to know this because we want to know what happens if we split on a specific value (what's the increase in purity? We want the one that decreases the impurity the most)
+# calculate the gain in node purity given a split
+# y-parent = a row of our data
+# l_index = which elements of y_parent should be sent left 
+# we are assuming we already know which way we are sending the data 
+information_gain <- function(y_parent, l_idx, r_idx, criterion = gini_index) {
+  
+  # now we know which bits of the outcome are going where 
+  y_left <- y_parent[l_idx]
+  y_right <- y_parent[r_idx]
+  
+  n <- length(y_parent)
+  n_l <- length(y_left)
+  n_r <- length(y_right)
+  
+  # here criterion is gini but it could be entropy or anything else that we care about 
+  I_p <- criterion(y_parent)
+  I_l <- criterion(y_left)
+  I_r <- criterion(y_right)
+  
+  # proprtion of observations we send left times the proportion of observations we send right
+  ig <- I_p - ((n_l)/n * I_l + (n_r)/n * I_r)
+  return(ig)
+}
+```
+
+To make a split we need to select the variable to split on and then the splitting point. To simplify the process, I focus on continuous predictors here. I here work backwards: finding the best splitting point *given* a variable, and then constructing another function to choose the best variable, given the best split point of each:
+
+```{r}
+# the next level is, we have the variable so we want to find the best point to split that variable at 
+# predictor = vactor of a variable (X1, X2, XN)
+# find best split for single variable
+best_var_split <- function(y, predictor, criterion = gini_index) {
+  
+  # get rid of the first one because there's nothing less than the first value once they're ordered anyways
+  split_vals <- sort(unique(predictor))[-1]
+  
+  # for every value in split value (c), we want to assign a value if it's less than c 
+  igs <- sapply(split_vals, function (c) {
+    l_idx <- which(predictor < c) # is the predictor is less than c then "which" records its position
+    r_idx <- which(predictor >= c) # the remaining indices
+    # returns a list 
+    return(information_gain(y, l_idx, r_idx, criterion = criterion))
+  })
+  
+  # return a list of the information gain and where we split to get that best gain
+  return(
+    list(
+      ig = max(igs),
+      # return the splitting value which is at the position where we maxxed the information gain
+      c = split_vals[which.max(igs)]
+    )
+  )
+}
+
+# now we have the best split conditional on a variable, so we need to search across the variables 
+# find best variable
+find_split <- function(y, X, criterion = gini_index) {
+  
+  best_igs <- apply(X, 2, function (x) best_var_split(y, x, criterion = criterion))
+  
+  # loop through the list of lists
+  # vector of best information gains for each predictor variable that we can split on 
+  best_idx <- which.max(sapply(best_igs, function (x) x$ig))
+  
+  return(
+    list(
+      var = names(X)[best_idx],
+      # corresponding splitting value
+      c = best_igs[[best_idx]]$c
+    )
+  )
+}
+```
+
+With this, I define the tree-fitting algorithm. I later make a function called `grow()` that starts with all the data, then successively splits the data until either the resulting node is "pure" or we reach a maximum depth (defined by a `MAX_DEPTH` parameter as we would find in a package).
+
+1) Check if we should split
+
+  * There are two conditions we would not want to split the data: 
+  
+    1) we are at the maximum depth
+    2) splitting would not yield an information gain because the node is already pure
+    
+  * In either case, we are at a terminal node and would return the average outcome for that subset
+
+```{r}
+# later this gets called the base case
+MAX_DEPTH = 10
+depth = 0 # we're at the root of our tree initially, record where we are initially
+
+# if your node is pure we don't want to stop
+if (gini_index(train_y) == 0) {
+  mean(train_y)
+} else if (depth == MAX_DEPTH) {
+  mean(train_y) 
+}
+```
+
+2) Assuming we can split, we now need to search for the best variable and splitting point. 
+
+```{r}
+# variable that we're gonna split on and the value we're gonna split at 
+best_split <- find_split(train_y, train_X)
+
+# we need to remember what the rules are so we can move down the tree with the test data to see what's the best
+decision <- paste0(best_split$var,"<",best_split$c)
+# variable less than the value
+print(decision)
+```
+
+3) Perform the split. The root of the *sub*tree will be the current decision, and it will have two branches. Therefore, I instantiate an empty list, which I use to store the left and right subsets of the data, having found the indices that do (not) satisfy the splitting criteria.
+  
+  * *NOTE*: for consistency, we'll assume that datapoints that satisfy the criteria get sent down the "left" or 1st branch, and those that don't get sent "right" or 2nd branch
+
+```{r}
+# create a subtree object (this is trees within trees)
+subtree <- list() # start empty 
+
+# in the first position of this subtree, 
+# create an empty list to store our branches
+# we name the sub-list decision --> list inside the list that has the name decision
+subtree[[decision]] <- list()
+
+# find the left and right indices
+# in the inner list store the two sub-sets of the data 
+left <- train_X[[best_split$var]] < best_split$c
+right <- !left
+
+# store the subsets in our subtree
+# go back into the decision node in the tree and append
+subtree[[decision]] <- append(subtree[[decision]], list('l' = train_X[left,]))
+subtree[[decision]] <- append(subtree[[decision]], list('r' = train_X[right,]))
+
+```
+
+We now need to make the algorithm recursive so that it can keep on splitting as we move along it: 
+
+```{r}
+# record depth as an argument because it will be lower so we need to keep track of it
+grow <- function(y, X, criterion = gini_index, depth = 0, MAX_DEPTH = 10) {
+  
+  # step 1: returning instead of just printing
+  # this is the best case 
+  if (criterion(y) == 0) {
+    return(mean(y)) 
+  } else if (depth == MAX_DEPTH) {
+    return(mean(y))
+  }
+  
+  # step 2: find the best split and record the decision 
+  best_split <- find_split(y,X)
+  decision <- paste0(best_split$var,"<",best_split$c)
+  
+  # step 3: create the subtree
+  subtree <- list()
+  # decision node and get left and right indices
+  subtree[[decision]] <- list()
+  left <- X[[best_split$var]] < best_split$c
+  right <- !left
+  
+
+  left_branch <- grow( # <- recursive call --> this is why we have the max depth so that this doesn't call itself again
+    y = y[left], 
+    X = X[left, ], # subsetting on rows
+    criterion = criterion, 
+    depth = depth + 1, # we're moving down and increment the decision counter 
+    MAX_DEPTH = MAX_DEPTH
+  )
+  
+  # same thing for the right hand side
+  right_branch <- grow( # <- recursive call
+    y[right], 
+    X[right, ], 
+    criterion = criterion, 
+    depth = depth + 1,
+    MAX_DEPTH = MAX_DEPTH
+  )
+  
+  # when the branches have evaluated, store the resulting subtree
+  subtree[[decision]] <- append(subtree[[decision]], left_branch)
+  subtree[[decision]] <- append(subtree[[decision]], right_branch)
+  
+  class(subtree) <- c("tree", "list") # set class so R knows what type of object
+  return(subtree)
+  
+}
+```
+
+Now I can train a tree on the data:
+
+```{r}
+tree <- grow(train_y, train_X)
+```
+
+Making predictions with the tree:
+
+```{r}
+parse_decision <- function(decision) {
+  
+  arguments <- strsplit(decision, split = "<")
+  var <- arguments[[1]][1] # this is just annoying indexing in R, it's the first item of the first list entry
+  val <- as.numeric(arguments[[1]][2]) # and likewise, this is the second item...
+  return(list(var = var, val = val))
+  
+}
+```
+```{r}
+# when you call predict and it detects it's a tree it will do this for you (generic function)
+predict.tree <- function(tree, Xtest) {
+  
+  # let's use apply to loop through every row (1)
+  preds <- apply(Xtest, 1, function (x) {
+    
+    pred <- NA # start with no prediction
+    tree_c <- tree # take a copy of the tree structure (snapshot tree_c = current tree)
+    # while my prediction is nothing keep going 
+    while (is.na(pred)) { # keep moving through tree until we have a prediction
+      
+      # extract the splitting variable and criteria
+      # we want to keep track of these decisions to split them later
+      decision <- parse_decision(names(tree_c))
+      
+      # Make decision: 1 = "left" and 2 = "right"
+      if (x[decision$var] < decision$val) {
+        dir = 1
+      } else {
+        dir = 2
+      }
+      
+      # Now we just check whether the resulting split is terminal
+      if (is.numeric(tree_c[[1]][[dir]])) {
+        pred = tree_c[[1]][[dir]] # if it's numeric we assign the prediction to that value
+      } else {
+        # if it's not numeric then we continue
+        tree_c = tree_c[[1]][dir] # extract the remaining subtree
+      }
+      
+    }
+    
+    return(pred)
+    
+  })
+  
+  return(preds)
+}
+```
+```{r}
+test_X <- genX(1000)
+test_y <- genY(test_X)
+
+yhat_probs <- predict(tree, test_X)
+yhat <- round(yhat_probs)
+
+print(yhat[1:10])
+
+```
+
+We can assess the accuracy in 3 ways: 
+
+```{r}
+# Unconditional accuracy
+# how often are the predicted values yhat equal to the test
+mean(yhat == test_y)
+
+# Accuracy for X2 < 0.35 (all red)
+c1 <- test_X$x2 < 0.35
+mean(yhat[c1] == test_y[c1])
+
+# Accuracy for where X1 > 0.7 (red and blue, but clear decision boundary)
+c2 <- test_X$X1 > 0.7
+mean(yhat[c2] == test_y[c2])
+
+```
